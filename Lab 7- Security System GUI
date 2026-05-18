@@ -1,0 +1,577 @@
+import csv
+import queue
+import sqlite3
+import threading
+import time
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError:
+    serial = None
+    list_ports = None
+
+
+DB_FILE = "rfid_database.db"
+SERIAL_PREFIX = "DATA_PACKET:"
+
+
+class RFIDDatabase:
+    def __init__(self, path=DB_FILE):
+        self.path = path
+        self.create_table()
+
+    def connect(self):
+        return sqlite3.connect(self.path)
+
+    def create_table(self):
+        # Create table if it does not exist
+        with self.connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid TEXT NOT NULL UNIQUE,
+                    scan_count INTEGER NOT NULL DEFAULT 1,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+
+    def record_scan(self, uid):
+        # Insert new tag or update scan count
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id, scan_count FROM tags WHERE uid = ?",
+                (uid,)
+            ).fetchone()
+
+            if existing:
+                tag_id, old_count = existing
+                new_count = old_count + 1
+
+                conn.execute("""
+                    UPDATE tags
+                    SET scan_count = ?, last_seen = ?
+                    WHERE id = ?
+                """, (new_count, now, tag_id))
+
+                conn.commit()
+                return tag_id, new_count, False
+
+            cursor = conn.execute("""
+                INSERT INTO tags (uid, scan_count, first_seen, last_seen)
+                VALUES (?, 1, ?, ?)
+            """, (uid, now, now))
+
+            conn.commit()
+            return cursor.lastrowid, 1, True
+
+    def fetch_all(self, search_text=""):
+        # Read database rows
+        with self.connect() as conn:
+            conn.row_factory = sqlite3.Row
+
+            if search_text.strip():
+                return conn.execute("""
+                    SELECT id, uid, scan_count, first_seen, last_seen
+                    FROM tags
+                    WHERE uid LIKE ?
+                    ORDER BY last_seen DESC
+                """, (f"%{search_text.strip().upper()}%",)).fetchall()
+
+            return conn.execute("""
+                SELECT id, uid, scan_count, first_seen, last_seen
+                FROM tags
+                ORDER BY last_seen DESC
+            """).fetchall()
+
+    def totals(self):
+        # Count unique tags and total scans
+        with self.connect() as conn:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) AS unique_tags,
+                    COALESCE(SUM(scan_count), 0) AS total_scans
+                FROM tags
+            """).fetchone()
+
+            return row[0], row[1]
+
+    def clear_all(self):
+        # Delete all records
+        with self.connect() as conn:
+            conn.execute("DELETE FROM tags")
+            conn.commit()
+
+
+class RFIDSecurityGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("RFID Security System Database")
+        self.root.geometry("980x650")
+        self.root.minsize(900, 560)
+
+        self.db = RFIDDatabase()
+
+        self.serial_connection = None
+        self.reader_thread = None
+        self.stop_event = threading.Event()
+        self.message_queue = queue.Queue()
+
+        self.port_var = tk.StringVar()
+        self.baud_var = tk.StringVar(value="9600")
+        self.status_var = tk.StringVar(value="Disconnected")
+        self.search_var = tk.StringVar()
+        self.details_var = tk.StringVar(value="Select a tag to see details.")
+        self.summary_var = tk.StringVar()
+
+        self.build_gui()
+        self.refresh_ports()
+        self.refresh_table()
+
+        # Check serial messages continuously
+        self.root.after(100, self.process_serial_messages)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def build_gui(self):
+        main = ttk.Frame(self.root, padding=12)
+        main.pack(fill="both", expand=True)
+
+        connection_frame = ttk.LabelFrame(main, text="Serial Connection", padding=10)
+        connection_frame.pack(fill="x")
+
+        ttk.Label(connection_frame, text="Port:").grid(row=0, column=0, sticky="w")
+
+        self.port_combo = ttk.Combobox(
+            connection_frame,
+            textvariable=self.port_var,
+            width=38,
+            state="readonly"
+        )
+        self.port_combo.grid(row=0, column=1, padx=6, sticky="w")
+
+        ttk.Button(
+            connection_frame,
+            text="Refresh",
+            command=self.refresh_ports
+        ).grid(row=0, column=2, padx=4)
+
+        ttk.Label(connection_frame, text="Baud:").grid(row=0, column=3, padx=(15, 4))
+
+        ttk.Entry(
+            connection_frame,
+            textvariable=self.baud_var,
+            width=10
+        ).grid(row=0, column=4)
+
+        self.connect_button = ttk.Button(
+            connection_frame,
+            text="Connect",
+            command=self.connect_serial
+        )
+        self.connect_button.grid(row=0, column=5, padx=(15, 4))
+
+        self.disconnect_button = ttk.Button(
+            connection_frame,
+            text="Disconnect",
+            command=self.disconnect_serial,
+            state="disabled"
+        )
+        self.disconnect_button.grid(row=0, column=6, padx=4)
+
+        ttk.Label(
+            connection_frame,
+            textvariable=self.status_var
+        ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(8, 0))
+
+        tools_frame = ttk.Frame(main)
+        tools_frame.pack(fill="x", pady=10)
+
+        ttk.Label(tools_frame, text="Search UID:").pack(side="left")
+
+        search_entry = ttk.Entry(
+            tools_frame,
+            textvariable=self.search_var,
+            width=28
+        )
+        search_entry.pack(side="left", padx=6)
+        search_entry.bind("<Return>", lambda event: self.refresh_table())
+
+        ttk.Button(
+            tools_frame,
+            text="Search",
+            command=self.refresh_table
+        ).pack(side="left", padx=3)
+
+        ttk.Button(
+            tools_frame,
+            text="Show All",
+            command=self.clear_search
+        ).pack(side="left", padx=3)
+
+        ttk.Button(
+            tools_frame,
+            text="Export CSV",
+            command=self.export_csv
+        ).pack(side="left", padx=3)
+
+        ttk.Button(
+            tools_frame,
+            text="Clear Database",
+            command=self.clear_database
+        ).pack(side="right")
+
+        table_frame = ttk.Frame(main)
+        table_frame.pack(fill="both", expand=True)
+
+        columns = ("id", "uid", "scan_count", "first_seen", "last_seen")
+
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse"
+        )
+
+        self.tree.heading("id", text="Unique ID")
+        self.tree.heading("uid", text="RFID UID")
+        self.tree.heading("scan_count", text="Scan Count")
+        self.tree.heading("first_seen", text="First Seen")
+        self.tree.heading("last_seen", text="Last Seen")
+
+        self.tree.column("id", width=90, anchor="center")
+        self.tree.column("uid", width=220, anchor="center")
+        self.tree.column("scan_count", width=100, anchor="center")
+        self.tree.column("first_seen", width=180, anchor="center")
+        self.tree.column("last_seen", width=180, anchor="center")
+
+        scrollbar = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=self.tree.yview
+        )
+
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.tree.bind("<<TreeviewSelect>>", self.update_selected_details)
+
+        navigation_frame = ttk.Frame(main)
+        navigation_frame.pack(fill="x", pady=(8, 0))
+
+        ttk.Button(navigation_frame, text="First", command=self.select_first).pack(side="left", padx=2)
+        ttk.Button(navigation_frame, text="Previous", command=self.select_previous).pack(side="left", padx=2)
+        ttk.Button(navigation_frame, text="Next", command=self.select_next).pack(side="left", padx=2)
+        ttk.Button(navigation_frame, text="Last", command=self.select_last).pack(side="left", padx=2)
+
+        ttk.Label(
+            navigation_frame,
+            textvariable=self.summary_var
+        ).pack(side="right")
+
+        details_frame = ttk.LabelFrame(main, text="Selected Tag / Log", padding=10)
+        details_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(
+            details_frame,
+            textvariable=self.details_var
+        ).pack(anchor="w")
+
+        self.log_box = tk.Text(details_frame, height=6, wrap="word")
+        self.log_box.pack(fill="x", pady=(8, 0))
+        self.log_box.configure(state="disabled")
+
+    def refresh_ports(self):
+        # Load available serial ports
+        if serial is None:
+            self.port_combo["values"] = []
+            self.status_var.set("Install pyserial: pip install pyserial")
+            return
+
+        ports = [
+            f"{port.device} - {port.description}"
+            for port in list_ports.comports()
+        ]
+
+        self.port_combo["values"] = ports
+
+        if ports and not self.port_var.get():
+            self.port_var.set(ports[0])
+
+    def connect_serial(self):
+        # Connect to Arduino
+        if serial is None:
+            messagebox.showerror("Missing library", "Install pyserial first:\npip install pyserial")
+            return
+
+        selected_port = self.port_var.get().strip()
+
+        if not selected_port:
+            messagebox.showwarning("No port selected", "Select the Arduino port first.")
+            return
+
+        port_name = selected_port.split(" - ")[0]
+
+        try:
+            baud_rate = int(self.baud_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid baud rate", "Baud rate must be a number.")
+            return
+
+        try:
+            self.serial_connection = serial.Serial(port_name, baud_rate, timeout=1)
+            time.sleep(2)
+        except Exception as error:
+            messagebox.showerror("Connection error", f"Could not open {port_name}:\n{error}")
+            return
+
+        self.stop_event.clear()
+
+        self.reader_thread = threading.Thread(
+            target=self.serial_reader_loop,
+            daemon=True
+        )
+        self.reader_thread.start()
+
+        self.status_var.set(f"Connected to {port_name}")
+        self.connect_button.configure(state="disabled")
+        self.disconnect_button.configure(state="normal")
+        self.add_log(f"Connected to {port_name}")
+
+    def disconnect_serial(self):
+        # Close serial connection
+        self.stop_event.set()
+
+        if self.serial_connection is not None:
+            try:
+                self.serial_connection.close()
+            except Exception:
+                pass
+
+        self.serial_connection = None
+
+        self.status_var.set("Disconnected")
+        self.connect_button.configure(state="normal")
+        self.disconnect_button.configure(state="disabled")
+        self.add_log("Disconnected")
+
+    def serial_reader_loop(self):
+        # Read serial data in background
+        while not self.stop_event.is_set():
+            try:
+                if self.serial_connection is None or not self.serial_connection.is_open:
+                    break
+
+                raw_line = self.serial_connection.readline()
+
+                if not raw_line:
+                    continue
+
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+
+                if line:
+                    self.message_queue.put(line)
+
+            except Exception as error:
+                self.message_queue.put(f"Serial error: {error}")
+                break
+
+    def process_serial_messages(self):
+        # Process Arduino messages
+        while not self.message_queue.empty():
+            line = self.message_queue.get()
+            self.add_log(line)
+
+            if line.startswith(SERIAL_PREFIX):
+                uid = line.replace(SERIAL_PREFIX, "", 1).strip().upper()
+
+                if uid:
+                    tag_id, scan_count, is_new = self.db.record_scan(uid)
+
+                    if is_new:
+                        self.add_log(f"New tag: ID={tag_id}, UID={uid}, scans={scan_count}")
+                    else:
+                        self.add_log(f"Updated tag: ID={tag_id}, UID={uid}, scans={scan_count}")
+
+                    self.refresh_table(select_id=tag_id)
+
+        self.root.after(100, self.process_serial_messages)
+
+    def refresh_table(self, select_id=None):
+        # Reload table data
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        rows = self.db.fetch_all(self.search_var.get())
+
+        for row in rows:
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(row["id"]),
+                values=(
+                    row["id"],
+                    row["uid"],
+                    row["scan_count"],
+                    row["first_seen"],
+                    row["last_seen"]
+                )
+            )
+
+        unique_tags, total_scans = self.db.totals()
+
+        self.summary_var.set(
+            f"Rows: {len(rows)} | Unique tags: {unique_tags} | Total scans: {total_scans}"
+        )
+
+        if select_id is not None and str(select_id) in self.tree.get_children():
+            self.tree.selection_set(str(select_id))
+            self.tree.focus(str(select_id))
+            self.tree.see(str(select_id))
+            self.update_selected_details()
+
+    def clear_search(self):
+        # Remove search filter
+        self.search_var.set("")
+        self.refresh_table()
+
+    def update_selected_details(self, event=None):
+        # Show selected row details
+        selected = self.tree.selection()
+
+        if not selected:
+            self.details_var.set("Select a tag to see details.")
+            return
+
+        values = self.tree.item(selected[0], "values")
+
+        self.details_var.set(
+            f"ID: {values[0]} | UID: {values[1]} | "
+            f"Scans: {values[2]} | First: {values[3]} | Last: {values[4]}"
+        )
+
+    def select_first(self):
+        items = self.tree.get_children()
+
+        if items:
+            self.select_item(items[0])
+
+    def select_last(self):
+        items = self.tree.get_children()
+
+        if items:
+            self.select_item(items[-1])
+
+    def select_previous(self):
+        items = list(self.tree.get_children())
+        selected = self.tree.selection()
+
+        if not items:
+            return
+
+        if not selected:
+            self.select_first()
+            return
+
+        current_index = items.index(selected[0])
+        new_index = max(0, current_index - 1)
+
+        self.select_item(items[new_index])
+
+    def select_next(self):
+        items = list(self.tree.get_children())
+        selected = self.tree.selection()
+
+        if not items:
+            return
+
+        if not selected:
+            self.select_first()
+            return
+
+        current_index = items.index(selected[0])
+        new_index = min(len(items) - 1, current_index + 1)
+
+        self.select_item(items[new_index])
+
+    def select_item(self, item_id):
+        # Select one table row
+        self.tree.selection_set(item_id)
+        self.tree.focus(item_id)
+        self.tree.see(item_id)
+        self.update_selected_details()
+
+    def export_csv(self):
+        # Export current table data
+        rows = self.db.fetch_all(self.search_var.get())
+
+        if not rows:
+            messagebox.showinfo("No data", "There is no data to export.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="Export RFID database",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv")]
+        )
+
+        if not file_path:
+            return
+
+        with open(file_path, "w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["Unique ID", "UID", "Scan Count", "First Seen", "Last Seen"])
+
+            for row in rows:
+                writer.writerow([
+                    row["id"],
+                    row["uid"],
+                    row["scan_count"],
+                    row["first_seen"],
+                    row["last_seen"]
+                ])
+
+        messagebox.showinfo("Export complete", f"Database exported to:\n{file_path}")
+
+    def clear_database(self):
+        # Delete all database records
+        confirm = messagebox.askyesno(
+            "Clear database",
+            "Delete all saved RFID records?"
+        )
+
+        if not confirm:
+            return
+
+        self.db.clear_all()
+        self.refresh_table()
+        self.details_var.set("Database cleared.")
+        self.add_log("Database cleared.")
+
+    def add_log(self, text):
+        # Add message to log area
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", f"{timestamp}  {text}\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def on_close(self):
+        # Close app safely
+        self.disconnect_serial()
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = RFIDSecurityGUI(root)
+    root.mainloop()
