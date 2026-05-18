@@ -1,0 +1,252 @@
+#include <Servo.h>
+#include <Stepper.h>
+
+// Pins
+const int player1Button = 2;
+const int player2Button = 3;
+
+const int stepperIN1 = 4;
+const int stepperIN2 = 5;
+const int stepperIN3 = 6;
+const int stepperIN4 = 7;
+
+const int buzzerPin = 8;
+const int servoPin = 9;
+const int potPin = A0;
+
+// Servo and stepper
+Servo winnerServo;
+
+const int stepsPerRevolution = 2048;
+Stepper gameStepper(stepsPerRevolution, stepperIN1, stepperIN3, stepperIN2, stepperIN4);
+
+// Game values
+int player1Score = 0;
+int player2Score = 0;
+
+const int winningScore = 3;
+
+const int servoPlayer1Angle = 20;
+const int servoNeutralAngle = 90;
+const int servoPlayer2Angle = 160;
+
+const int tugSteps = 256;
+
+void setup() {
+  Serial.begin(9600);
+
+  // Buttons use internal pull-ups
+  pinMode(player1Button, INPUT_PULLUP);
+  pinMode(player2Button, INPUT_PULLUP);
+
+  pinMode(buzzerPin, OUTPUT);
+
+  // Start servo at center
+  winnerServo.attach(servoPin);
+  winnerServo.write(servoNeutralAngle);
+
+  // Set stepper speed
+  gameStepper.setSpeed(10);
+
+  // Random seed from unused analog pin
+  randomSeed(analogRead(A1));
+
+  Serial.println("Reaction game ready.");
+  Serial.println("Press both buttons to start.");
+}
+
+void loop() {
+  // Start when both buttons are pressed
+  if (buttonPressed(player1Button) && buttonPressed(player2Button)) {
+    delay(500);
+    waitForButtonsReleased();
+    startGame();
+  }
+}
+
+// Starts a new game
+void startGame() {
+  player1Score = 0;
+  player2Score = 0;
+
+  winnerServo.write(servoNeutralAngle);
+  noTone(buzzerPin);
+
+  Serial.println("New game started.");
+
+  // Play until one player reaches 3 points
+  while (player1Score < winningScore && player2Score < winningScore) {
+    playRound();
+
+    Serial.print("Score: P1=");
+    Serial.print(player1Score);
+    Serial.print(" P2=");
+    Serial.println(player2Score);
+
+    delay(1500);
+  }
+
+  // Declare final winner
+  if (player1Score == winningScore) {
+    Serial.println("PLAYER 1 WINS!");
+    winnerServo.write(servoPlayer1Angle);
+    victorySpin(1);
+  } else {
+    Serial.println("PLAYER 2 WINS!");
+    winnerServo.write(servoPlayer2Angle);
+    victorySpin(2);
+  }
+
+  Serial.println("Press both buttons to start again.");
+  waitForButtonsReleased();
+}
+
+// Plays one round
+void playRound() {
+  winnerServo.write(servoNeutralAngle);
+  noTone(buzzerPin);
+
+  // Potentiometer controls max wait time
+  int potValue = analogRead(potPin);
+  int maxWaitSeconds = map(potValue, 0, 1023, 1, 20);
+
+  unsigned long waitTime = random(1000, maxWaitSeconds * 1000UL + 1);
+  unsigned long waitStart = millis();
+
+  Serial.println("Wait for buzzer.");
+
+  // Check for false starts
+  while (millis() - waitStart < waitTime) {
+    if (buttonPressed(player1Button)) {
+      Serial.println("False start: Player 1");
+      beepFalseStart();
+      awardPoint(2);
+      waitForButtonsReleased();
+      return;
+    }
+
+    if (buttonPressed(player2Button)) {
+      Serial.println("False start: Player 2");
+      beepFalseStart();
+      awardPoint(1);
+      waitForButtonsReleased();
+      return;
+    }
+  }
+
+  // Start reaction timer
+  Serial.println("GO!");
+  tone(buzzerPin, 1000);
+
+  unsigned long reactionStart = millis();
+
+  while (true) {
+    bool p1Pressed = buttonPressed(player1Button);
+    bool p2Pressed = buttonPressed(player2Button);
+
+    // Tie case
+    if (p1Pressed && p2Pressed) {
+      Serial.println("Tie. No point.");
+      noTone(buzzerPin);
+      waitForButtonsReleased();
+      return;
+    }
+
+    // Player 1 wins round
+    if (p1Pressed) {
+      unsigned long reactionTime = millis() - reactionStart;
+
+      noTone(buzzerPin);
+
+      Serial.print("Player 1 reaction time: ");
+      Serial.print(reactionTime);
+      Serial.println(" ms");
+
+      awardPoint(1);
+      waitForButtonsReleased();
+      return;
+    }
+
+    // Player 2 wins round
+    if (p2Pressed) {
+      unsigned long reactionTime = millis() - reactionStart;
+
+      noTone(buzzerPin);
+
+      Serial.print("Player 2 reaction time: ");
+      Serial.print(reactionTime);
+      Serial.println(" ms");
+
+      awardPoint(2);
+      waitForButtonsReleased();
+      return;
+    }
+  }
+}
+
+// Gives point and moves motors
+void awardPoint(int winner) {
+  if (winner == 1) {
+    player1Score++;
+
+    winnerServo.write(servoPlayer1Angle);
+    gameStepper.step(tugSteps);
+  } else {
+    player2Score++;
+
+    winnerServo.write(servoPlayer2Angle);
+    gameStepper.step(-tugSteps);
+  }
+}
+
+// Spins stepper for final winner
+void victorySpin(int winner) {
+  beepVictory();
+
+  if (winner == 1) {
+    gameStepper.step(stepsPerRevolution);
+  } else {
+    gameStepper.step(-stepsPerRevolution);
+  }
+}
+
+// False start sound
+void beepFalseStart() {
+  tone(buzzerPin, 300);
+  delay(400);
+  noTone(buzzerPin);
+}
+
+// Victory sound
+void beepVictory() {
+  tone(buzzerPin, 800);
+  delay(200);
+
+  tone(buzzerPin, 1000);
+  delay(200);
+
+  tone(buzzerPin, 1200);
+  delay(300);
+
+  noTone(buzzerPin);
+}
+
+// Reads button with debounce
+bool buttonPressed(int buttonPin) {
+  if (digitalRead(buttonPin) == LOW) {
+    delay(30);
+
+    if (digitalRead(buttonPin) == LOW) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Waits until buttons are released
+void waitForButtonsReleased() {
+  while (digitalRead(player1Button) == LOW || digitalRead(player2Button) == LOW) {
+    delay(10);
+  }
+}
