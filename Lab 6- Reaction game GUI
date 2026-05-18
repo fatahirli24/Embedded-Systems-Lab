@@ -1,0 +1,1050 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import serial
+import serial.tools.list_ports
+import threading
+import queue
+import csv
+import os
+import re
+from datetime import datetime
+import matplotlib.pyplot as plt
+
+
+# ==========================
+# Data file setup
+# ==========================
+
+DATA_DIR = "data"
+PLAYERS_DIR = os.path.join(DATA_DIR, "players")
+
+ALL_ROUNDS_FILE = os.path.join(DATA_DIR, "all_rounds.csv")
+ALL_VICTORIES_FILE = os.path.join(DATA_DIR, "all_victories.csv")
+
+REACTION_FIELDS = [
+    "session_id",
+    "date",
+    "time",
+    "round",
+    "player",
+    "opponent",
+    "round_result",
+    "round_winner",
+    "player_score_after_round",
+    "opponent_score_after_round",
+    "player_reaction_ms",
+    "opponent_reaction_ms",
+    "false_start_by_player",
+    "false_start_by",
+    "result_type"
+]
+
+VICTORY_FIELDS = [
+    "session_id",
+    "date",
+    "time",
+    "player",
+    "opponent",
+    "game_result",
+    "game_winner",
+    "player_final_score",
+    "opponent_final_score"
+]
+
+
+def safe_filename(name):
+    name = name.strip()
+    name = re.sub(r'[<>:"/\\|?*]', "", name)
+    name = name.replace(" ", "_")
+
+    if name == "":
+        name = "Unknown_Player"
+
+    return name
+
+
+class ReactionGameGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Two Player Reaction Game GUI")
+        self.root.geometry("1100x780")
+
+        self.serial_conn = None
+        self.serial_thread = None
+        self.running = False
+        self.serial_queue = queue.Queue()
+
+        self.player1_name = tk.StringVar(value="Player 1")
+        self.player2_name = tk.StringVar(value="Player 2")
+        self.selected_port = tk.StringVar()
+        self.baud_rate = tk.StringVar(value="9600")
+
+        self.plot_player_name = tk.StringVar()
+        self.head_to_head_player = tk.StringVar()
+        self.head_to_head_opponent = tk.StringVar()
+
+        self.records_player = tk.StringVar()
+
+        self.p1_score = 0
+        self.p2_score = 0
+        self.current_round = 1
+        self.session_id = self.generate_session_id()
+        self.victory_saved = False
+
+        os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(PLAYERS_DIR, exist_ok=True)
+
+        self.create_widgets()
+        self.refresh_ports()
+        self.refresh_player_list()
+
+        self.root.after(100, self.process_serial_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ==========================
+    # GUI layout
+    # ==========================
+
+    def create_widgets(self):
+        title = tk.Label(
+            self.root,
+            text="Two Player Reaction Game",
+            font=("Arial", 20, "bold")
+        )
+        title.pack(pady=8)
+
+        player_frame = tk.LabelFrame(self.root, text="Players", padx=10, pady=8)
+        player_frame.pack(fill="x", padx=15, pady=4)
+
+        tk.Label(player_frame, text="Player 1 Name:").grid(row=0, column=0, padx=5, pady=5)
+        tk.Entry(player_frame, textvariable=self.player1_name, width=25).grid(row=0, column=1, padx=5)
+
+        tk.Label(player_frame, text="Player 2 Name:").grid(row=0, column=2, padx=5, pady=5)
+        tk.Entry(player_frame, textvariable=self.player2_name, width=25).grid(row=0, column=3, padx=5)
+
+        port_frame = tk.LabelFrame(self.root, text="Arduino Connection", padx=10, pady=8)
+        port_frame.pack(fill="x", padx=15, pady=4)
+
+        tk.Label(port_frame, text="Arduino Port:").grid(row=0, column=0, padx=5)
+
+        self.port_combo = ttk.Combobox(
+            port_frame,
+            textvariable=self.selected_port,
+            width=20,
+            state="readonly"
+        )
+        self.port_combo.grid(row=0, column=1, padx=5)
+
+        tk.Button(port_frame, text="Refresh Ports", command=self.refresh_ports).grid(row=0, column=2, padx=5)
+
+        tk.Label(port_frame, text="Baud:").grid(row=0, column=3, padx=5)
+        tk.Entry(port_frame, textvariable=self.baud_rate, width=10).grid(row=0, column=4, padx=5)
+
+        self.connect_button = tk.Button(
+            port_frame,
+            text="Connect",
+            command=self.connect_serial,
+            bg="#4CAF50",
+            fg="white",
+            width=12
+        )
+        self.connect_button.grid(row=0, column=5, padx=5)
+
+        self.disconnect_button = tk.Button(
+            port_frame,
+            text="Disconnect",
+            command=self.disconnect_serial,
+            bg="#D9534F",
+            fg="white",
+            width=12,
+            state="disabled"
+        )
+        self.disconnect_button.grid(row=0, column=6, padx=5)
+
+        game_frame = tk.LabelFrame(self.root, text="Game Control", padx=10, pady=8)
+        game_frame.pack(fill="x", padx=15, pady=4)
+
+        self.start_button = tk.Button(
+            game_frame,
+            text="Start Game from GUI",
+            command=self.start_gui_game,
+            bg="#2196F3",
+            fg="white",
+            width=22,
+            height=2
+        )
+        self.start_button.grid(row=0, column=0, padx=10)
+
+        self.reset_button = tk.Button(
+            game_frame,
+            text="Reset GUI Scores",
+            command=self.reset_gui_scores,
+            width=18,
+            height=2
+        )
+        self.reset_button.grid(row=0, column=1, padx=10)
+
+        self.score_label = tk.Label(
+            game_frame,
+            text="Score: Player 1 = 0 | Player 2 = 0",
+            font=("Arial", 15, "bold")
+        )
+        self.score_label.grid(row=0, column=2, padx=20)
+
+        self.status_label = tk.Label(
+            self.root,
+            text="Enter player names, connect Arduino, then start the game.",
+            font=("Arial", 12),
+            fg="blue"
+        )
+        self.status_label.pack(pady=5)
+
+        viz_frame = tk.LabelFrame(self.root, text="Data Visualization", padx=10, pady=8)
+        viz_frame.pack(fill="x", padx=15, pady=4)
+
+        tk.Label(viz_frame, text="Player:").grid(row=0, column=0, padx=5)
+        tk.Entry(viz_frame, textvariable=self.plot_player_name, width=22).grid(row=0, column=1, padx=5)
+
+        tk.Button(
+            viz_frame,
+            text="Plot Reaction Times",
+            command=self.plot_reaction_times
+        ).grid(row=0, column=2, padx=5)
+
+        tk.Label(viz_frame, text="Head-to-head player:").grid(row=1, column=0, padx=5, pady=8)
+        tk.Entry(viz_frame, textvariable=self.head_to_head_player, width=22).grid(row=1, column=1, padx=5)
+
+        tk.Label(viz_frame, text="Opponent:").grid(row=1, column=2, padx=5)
+        tk.Entry(viz_frame, textvariable=self.head_to_head_opponent, width=22).grid(row=1, column=3, padx=5)
+
+        tk.Button(
+            viz_frame,
+            text="Plot Head-to-Head",
+            command=self.plot_head_to_head
+        ).grid(row=1, column=4, padx=5)
+
+        tk.Button(
+            viz_frame,
+            text="Use Current Players",
+            command=self.fill_visualization_names
+        ).grid(row=0, column=3, padx=5)
+
+        records_frame = tk.LabelFrame(self.root, text="Player Records: Reactions and Victories", padx=10, pady=8)
+        records_frame.pack(fill="both", expand=True, padx=15, pady=4)
+
+        records_top = tk.Frame(records_frame)
+        records_top.pack(fill="x")
+
+        tk.Label(records_top, text="Select Player:").pack(side="left", padx=5)
+
+        self.records_combo = ttk.Combobox(
+            records_top,
+            textvariable=self.records_player,
+            width=25,
+            state="readonly"
+        )
+        self.records_combo.pack(side="left", padx=5)
+
+        tk.Button(records_top, text="Refresh Players", command=self.refresh_player_list).pack(side="left", padx=5)
+        tk.Button(records_top, text="Load Player Records", command=self.load_player_records).pack(side="left", padx=5)
+
+        self.records_summary_label = tk.Label(
+            records_top,
+            text="No player loaded.",
+            font=("Arial", 11, "bold"),
+            fg="purple"
+        )
+        self.records_summary_label.pack(side="left", padx=15)
+
+        tables_frame = tk.Frame(records_frame)
+        tables_frame.pack(fill="both", expand=True, pady=8)
+
+        left_table_frame = tk.LabelFrame(tables_frame, text="Reaction / Round Data")
+        left_table_frame.pack(side="left", fill="both", expand=True, padx=5)
+
+        right_table_frame = tk.LabelFrame(tables_frame, text="Victory / Game Data")
+        right_table_frame.pack(side="left", fill="both", expand=True, padx=5)
+
+        self.reaction_tree = ttk.Treeview(
+            left_table_frame,
+            columns=("date", "time", "opponent", "round", "result", "reaction", "false_start"),
+            show="headings",
+            height=8
+        )
+
+        reaction_headings = {
+            "date": "Date",
+            "time": "Time",
+            "opponent": "Opponent",
+            "round": "Round",
+            "result": "Result",
+            "reaction": "Reaction ms",
+            "false_start": "False Start"
+        }
+
+        for col, heading in reaction_headings.items():
+            self.reaction_tree.heading(col, text=heading)
+            self.reaction_tree.column(col, width=95)
+
+        self.reaction_tree.pack(side="left", fill="both", expand=True)
+
+        reaction_scroll = tk.Scrollbar(left_table_frame, command=self.reaction_tree.yview)
+        reaction_scroll.pack(side="right", fill="y")
+        self.reaction_tree.config(yscrollcommand=reaction_scroll.set)
+
+        self.victory_tree = ttk.Treeview(
+            right_table_frame,
+            columns=("date", "time", "opponent", "result", "winner", "score"),
+            show="headings",
+            height=8
+        )
+
+        victory_headings = {
+            "date": "Date",
+            "time": "Time",
+            "opponent": "Opponent",
+            "result": "Game Result",
+            "winner": "Winner",
+            "score": "Final Score"
+        }
+
+        for col, heading in victory_headings.items():
+            self.victory_tree.heading(col, text=heading)
+            self.victory_tree.column(col, width=100)
+
+        self.victory_tree.pack(side="left", fill="both", expand=True)
+
+        victory_scroll = tk.Scrollbar(right_table_frame, command=self.victory_tree.yview)
+        victory_scroll.pack(side="right", fill="y")
+        self.victory_tree.config(yscrollcommand=victory_scroll.set)
+
+        log_frame = tk.LabelFrame(self.root, text="Arduino / Game Log", padx=10, pady=8)
+        log_frame.pack(fill="both", expand=True, padx=15, pady=8)
+
+        self.log_text = tk.Text(log_frame, height=8, wrap="word")
+        self.log_text.pack(side="left", fill="both", expand=True)
+
+        scrollbar = tk.Scrollbar(log_frame, command=self.log_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.log_text.config(yscrollcommand=scrollbar.set)
+
+    # ==========================
+    # Serial connection
+    # ==========================
+
+    def refresh_ports(self):
+        ports = serial.tools.list_ports.comports()
+        port_names = [port.device for port in ports]
+
+        self.port_combo["values"] = port_names
+
+        if port_names:
+            self.selected_port.set(port_names[0])
+        else:
+            self.selected_port.set("")
+
+    def connect_serial(self):
+        port = self.selected_port.get()
+
+        if not port:
+            messagebox.showerror("Error", "No Arduino port selected.")
+            return
+
+        try:
+            baud = int(self.baud_rate.get())
+
+            self.serial_conn = serial.Serial(port, baud, timeout=1)
+            self.running = True
+
+            self.serial_thread = threading.Thread(target=self.read_serial, daemon=True)
+            self.serial_thread.start()
+
+            self.connect_button.config(state="disabled")
+            self.disconnect_button.config(state="normal")
+
+            self.log(f"Connected to Arduino on {port} at {baud} baud.")
+            self.status_label.config(text="Connected to Arduino.", fg="green")
+
+        except Exception as e:
+            messagebox.showerror("Connection Error", str(e))
+
+    def disconnect_serial(self):
+        self.running = False
+
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+
+        self.connect_button.config(state="normal")
+        self.disconnect_button.config(state="disabled")
+
+        self.log("Disconnected from Arduino.")
+        self.status_label.config(text="Disconnected.", fg="red")
+
+    def read_serial(self):
+        while self.running:
+            try:
+                if self.serial_conn and self.serial_conn.in_waiting > 0:
+                    line = self.serial_conn.readline().decode(errors="ignore").strip()
+                    if line:
+                        self.serial_queue.put(line)
+
+            except Exception as e:
+                self.serial_queue.put(f"Serial error: {e}")
+                break
+
+    def process_serial_queue(self):
+        while not self.serial_queue.empty():
+            line = self.serial_queue.get()
+            self.log(line)
+            self.handle_arduino_message(line)
+
+        self.root.after(100, self.process_serial_queue)
+
+    # ==========================
+    # Game control
+    # ==========================
+
+    def start_gui_game(self):
+        p1 = self.player1_name.get().strip()
+        p2 = self.player2_name.get().strip()
+
+        if not p1 or not p2:
+            messagebox.showerror("Error", "Please enter both player names.")
+            return
+
+        if p1 == p2:
+            messagebox.showerror("Error", "Player names must be different.")
+            return
+
+        self.ensure_player_files(p1)
+        self.ensure_player_files(p2)
+
+        self.reset_gui_scores()
+        self.session_id = self.generate_session_id()
+        self.victory_saved = False
+
+        self.fill_visualization_names()
+        self.refresh_player_list()
+
+        self.records_player.set(p1)
+        self.load_player_records()
+
+        self.log("========== GUI SESSION STARTED ==========")
+        self.log(f"Session ID: {self.session_id}")
+        self.log(f"Player 1: {p1}")
+        self.log(f"Player 2: {p2}")
+
+        self.status_label.config(text="Game started from GUI.", fg="green")
+
+        if self.serial_conn and self.serial_conn.is_open:
+            try:
+                self.serial_conn.write(f"START,{p1},{p2}\n".encode())
+            except Exception as e:
+                messagebox.showerror("Serial Error", str(e))
+        else:
+            messagebox.showwarning(
+                "Arduino Not Connected",
+                "GUI was reset, but Arduino is not connected."
+            )
+
+    def reset_gui_scores(self):
+        self.p1_score = 0
+        self.p2_score = 0
+        self.current_round = 1
+        self.victory_saved = False
+        self.update_score_label()
+
+    def handle_arduino_message(self, line):
+        p1 = self.player1_name.get().strip() or "Player 1"
+        p2 = self.player2_name.get().strip() or "Player 2"
+
+        if "========== NEW GAME STARTED ==========" in line:
+            self.p1_score = 0
+            self.p2_score = 0
+            self.current_round = 1
+            self.victory_saved = False
+            self.session_id = self.generate_session_id()
+
+            self.ensure_player_files(p1)
+            self.ensure_player_files(p2)
+            self.refresh_player_list()
+
+            self.update_score_label()
+            self.status_label.config(text="Arduino game started.", fg="green")
+            return
+
+        if "False start by Player 1" in line:
+            self.p2_score += 1
+
+            round_row = self.create_round_row(
+                player1=p1,
+                player2=p2,
+                round_winner=p2,
+                p1_reaction_ms="",
+                p2_reaction_ms="",
+                false_start_by=p1,
+                result_type="FALSE_START"
+            )
+
+            self.save_round(round_row)
+            self.current_round += 1
+            self.update_score_label()
+            self.status_label.config(text=f"False start by {p1}. Point to {p2}.", fg="orange")
+            self.load_player_records_for_current_selection()
+            return
+
+        if "False start by Player 2" in line:
+            self.p1_score += 1
+
+            round_row = self.create_round_row(
+                player1=p1,
+                player2=p2,
+                round_winner=p1,
+                p1_reaction_ms="",
+                p2_reaction_ms="",
+                false_start_by=p2,
+                result_type="FALSE_START"
+            )
+
+            self.save_round(round_row)
+            self.current_round += 1
+            self.update_score_label()
+            self.status_label.config(text=f"False start by {p2}. Point to {p1}.", fg="orange")
+            self.load_player_records_for_current_selection()
+            return
+
+        if "Both players pressed at almost the same time" in line:
+            round_row = self.create_round_row(
+                player1=p1,
+                player2=p2,
+                round_winner="TIE",
+                p1_reaction_ms="",
+                p2_reaction_ms="",
+                false_start_by="",
+                result_type="TIE"
+            )
+
+            self.save_round(round_row)
+            self.current_round += 1
+            self.update_score_label()
+            self.status_label.config(text="Tie round. No point awarded.", fg="orange")
+            self.load_player_records_for_current_selection()
+            return
+
+        p1_match = re.search(r"Player 1 pressed first! Reaction time: (\d+) ms", line)
+        if p1_match:
+            reaction_time = p1_match.group(1)
+            self.p1_score += 1
+
+            round_row = self.create_round_row(
+                player1=p1,
+                player2=p2,
+                round_winner=p1,
+                p1_reaction_ms=reaction_time,
+                p2_reaction_ms="",
+                false_start_by="",
+                result_type="NORMAL"
+            )
+
+            self.save_round(round_row)
+            self.current_round += 1
+            self.update_score_label()
+            self.status_label.config(text=f"{p1} won the round. Reaction: {reaction_time} ms", fg="green")
+            self.load_player_records_for_current_selection()
+            return
+
+        p2_match = re.search(r"Player 2 pressed first! Reaction time: (\d+) ms", line)
+        if p2_match:
+            reaction_time = p2_match.group(1)
+            self.p2_score += 1
+
+            round_row = self.create_round_row(
+                player1=p1,
+                player2=p2,
+                round_winner=p2,
+                p1_reaction_ms="",
+                p2_reaction_ms=reaction_time,
+                false_start_by="",
+                result_type="NORMAL"
+            )
+
+            self.save_round(round_row)
+            self.current_round += 1
+            self.update_score_label()
+            self.status_label.config(text=f"{p2} won the round. Reaction: {reaction_time} ms", fg="green")
+            self.load_player_records_for_current_selection()
+            return
+
+        if "PLAYER 1 WINS THE GAME" in line:
+            self.status_label.config(text=f"{p1} wins the full game!", fg="purple")
+            self.save_victory(game_winner=p1, loser=p2)
+            self.load_player_records_for_current_selection()
+            return
+
+        if "PLAYER 2 WINS THE GAME" in line:
+            self.status_label.config(text=f"{p2} wins the full game!", fg="purple")
+            self.save_victory(game_winner=p2, loser=p1)
+            self.load_player_records_for_current_selection()
+            return
+
+    def update_score_label(self):
+        p1 = self.player1_name.get().strip() or "Player 1"
+        p2 = self.player2_name.get().strip() or "Player 2"
+
+        self.score_label.config(
+            text=f"Score: {p1} = {self.p1_score} | {p2} = {self.p2_score}"
+        )
+
+    # ==========================
+    # Saving data
+    # ==========================
+
+    def generate_session_id(self):
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def ensure_player_files(self, player_name):
+        self.get_player_folder(player_name)
+        self.create_csv_if_missing(self.get_player_reactions_file(player_name), REACTION_FIELDS)
+        self.create_csv_if_missing(self.get_player_victories_file(player_name), VICTORY_FIELDS)
+
+    def create_csv_if_missing(self, filename, fieldnames):
+        if not os.path.exists(filename):
+            with open(filename, "w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(file, fieldnames=fieldnames)
+                writer.writeheader()
+
+    def create_round_row(
+        self,
+        player1,
+        player2,
+        round_winner,
+        p1_reaction_ms,
+        p2_reaction_ms,
+        false_start_by,
+        result_type
+    ):
+        now = datetime.now()
+
+        return {
+            "session_id": self.session_id,
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
+            "round": self.current_round,
+            "player1": player1,
+            "player2": player2,
+            "round_winner": round_winner,
+            "p1_score_after_round": self.p1_score,
+            "p2_score_after_round": self.p2_score,
+            "p1_reaction_ms": p1_reaction_ms,
+            "p2_reaction_ms": p2_reaction_ms,
+            "false_start_by": false_start_by,
+            "result_type": result_type
+        }
+
+    def save_round(self, row):
+        self.append_csv(ALL_ROUNDS_FILE, row)
+
+        p1 = row["player1"]
+        p2 = row["player2"]
+
+        self.ensure_player_files(p1)
+        self.ensure_player_files(p2)
+
+        p1_personal_row = self.create_personal_round_row(row, perspective_player=p1, opponent=p2)
+        p2_personal_row = self.create_personal_round_row(row, perspective_player=p2, opponent=p1)
+
+        self.append_csv(self.get_player_reactions_file(p1), p1_personal_row)
+        self.append_csv(self.get_player_reactions_file(p2), p2_personal_row)
+
+        self.refresh_player_list()
+
+    def create_personal_round_row(self, row, perspective_player, opponent):
+        if perspective_player == row["player1"]:
+            player_reaction = row["p1_reaction_ms"]
+            opponent_reaction = row["p2_reaction_ms"]
+            player_score = row["p1_score_after_round"]
+            opponent_score = row["p2_score_after_round"]
+        else:
+            player_reaction = row["p2_reaction_ms"]
+            opponent_reaction = row["p1_reaction_ms"]
+            player_score = row["p2_score_after_round"]
+            opponent_score = row["p1_score_after_round"]
+
+        if row["round_winner"] == perspective_player:
+            round_result = "WIN"
+        elif row["round_winner"] == "TIE":
+            round_result = "TIE"
+        else:
+            round_result = "LOSS"
+
+        false_start_by_player = "YES" if row["false_start_by"] == perspective_player else "NO"
+
+        return {
+            "session_id": row["session_id"],
+            "date": row["date"],
+            "time": row["time"],
+            "round": row["round"],
+            "player": perspective_player,
+            "opponent": opponent,
+            "round_result": round_result,
+            "round_winner": row["round_winner"],
+            "player_score_after_round": player_score,
+            "opponent_score_after_round": opponent_score,
+            "player_reaction_ms": player_reaction,
+            "opponent_reaction_ms": opponent_reaction,
+            "false_start_by_player": false_start_by_player,
+            "false_start_by": row["false_start_by"],
+            "result_type": row["result_type"]
+        }
+
+    def save_victory(self, game_winner, loser):
+        if self.victory_saved:
+            return
+
+        self.victory_saved = True
+
+        now = datetime.now()
+
+        p1 = self.player1_name.get().strip() or "Player 1"
+        p2 = self.player2_name.get().strip() or "Player 2"
+
+        victory_row = {
+            "session_id": self.session_id,
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
+            "player1": p1,
+            "player2": p2,
+            "game_winner": game_winner,
+            "loser": loser,
+            "final_p1_score": self.p1_score,
+            "final_p2_score": self.p2_score
+        }
+
+        self.append_csv(ALL_VICTORIES_FILE, victory_row)
+
+        winner_score = self.p1_score if game_winner == p1 else self.p2_score
+        loser_score = self.p1_score if loser == p1 else self.p2_score
+
+        winner_personal_row = {
+            "session_id": self.session_id,
+            "date": victory_row["date"],
+            "time": victory_row["time"],
+            "player": game_winner,
+            "opponent": loser,
+            "game_result": "WIN",
+            "game_winner": game_winner,
+            "player_final_score": winner_score,
+            "opponent_final_score": loser_score
+        }
+
+        loser_personal_row = {
+            "session_id": self.session_id,
+            "date": victory_row["date"],
+            "time": victory_row["time"],
+            "player": loser,
+            "opponent": game_winner,
+            "game_result": "LOSS",
+            "game_winner": game_winner,
+            "player_final_score": loser_score,
+            "opponent_final_score": winner_score
+        }
+
+        self.ensure_player_files(game_winner)
+        self.ensure_player_files(loser)
+
+        self.append_csv(self.get_player_victories_file(game_winner), winner_personal_row)
+        self.append_csv(self.get_player_victories_file(loser), loser_personal_row)
+
+        self.refresh_player_list()
+
+        self.records_player.set(game_winner)
+        self.load_player_records()
+
+        self.log(f"Victory saved: {game_winner} defeated {loser}.")
+
+    def get_player_folder(self, player_name):
+        folder_name = safe_filename(player_name)
+        folder_path = os.path.join(PLAYERS_DIR, folder_name)
+        os.makedirs(folder_path, exist_ok=True)
+        return folder_path
+
+    def get_player_reactions_file(self, player_name):
+        return os.path.join(self.get_player_folder(player_name), "reactions.csv")
+
+    def get_player_victories_file(self, player_name):
+        return os.path.join(self.get_player_folder(player_name), "victories.csv")
+
+    def append_csv(self, filename, row):
+        file_exists = os.path.exists(filename)
+
+        with open(filename, "a", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=row.keys())
+
+            if not file_exists:
+                writer.writeheader()
+
+            writer.writerow(row)
+
+    # ==========================
+    # Reading data
+    # ==========================
+
+    def read_csv_file(self, filename):
+        if not os.path.exists(filename):
+            return []
+
+        with open(filename, "r", encoding="utf-8") as file:
+            return list(csv.DictReader(file))
+
+    def read_player_reactions(self, player_name):
+        filename = self.get_player_reactions_file(player_name)
+        return self.read_csv_file(filename)
+
+    def read_player_victories(self, player_name):
+        filename = self.get_player_victories_file(player_name)
+        return self.read_csv_file(filename)
+
+    # ==========================
+    # Player records in GUI
+    # ==========================
+
+    def refresh_player_list(self):
+        players = []
+
+        if os.path.exists(PLAYERS_DIR):
+            for folder in os.listdir(PLAYERS_DIR):
+                full_path = os.path.join(PLAYERS_DIR, folder)
+                if os.path.isdir(full_path):
+                    players.append(folder.replace("_", " "))
+
+        players = sorted(set(players))
+
+        self.records_combo["values"] = players
+
+        if players and not self.records_player.get():
+            self.records_player.set(players[0])
+
+    def load_player_records_for_current_selection(self):
+        if self.records_player.get():
+            self.load_player_records()
+
+    def load_player_records(self):
+        player = self.records_player.get().strip()
+
+        if not player:
+            messagebox.showerror("Error", "Select a player first.")
+            return
+
+        for item in self.reaction_tree.get_children():
+            self.reaction_tree.delete(item)
+
+        for item in self.victory_tree.get_children():
+            self.victory_tree.delete(item)
+
+        reaction_rows = self.read_player_reactions(player)
+        victory_rows = self.read_player_victories(player)
+
+        for row in reaction_rows:
+            self.reaction_tree.insert(
+                "",
+                "end",
+                values=(
+                    row.get("date", ""),
+                    row.get("time", ""),
+                    row.get("opponent", ""),
+                    row.get("round", ""),
+                    row.get("round_result", ""),
+                    row.get("player_reaction_ms", ""),
+                    row.get("false_start_by_player", "")
+                )
+            )
+
+        for row in victory_rows:
+            score_text = f"{row.get('player_final_score', '')}-{row.get('opponent_final_score', '')}"
+
+            self.victory_tree.insert(
+                "",
+                "end",
+                values=(
+                    row.get("date", ""),
+                    row.get("time", ""),
+                    row.get("opponent", ""),
+                    row.get("game_result", ""),
+                    row.get("game_winner", ""),
+                    score_text
+                )
+            )
+
+        wins = sum(1 for row in reaction_rows if row.get("round_result") == "WIN")
+        losses = sum(1 for row in reaction_rows if row.get("round_result") == "LOSS")
+        game_wins = sum(1 for row in victory_rows if row.get("game_result") == "WIN")
+        game_losses = sum(1 for row in victory_rows if row.get("game_result") == "LOSS")
+
+        reaction_values = [
+            int(row["player_reaction_ms"])
+            for row in reaction_rows
+            if row.get("player_reaction_ms", "").isdigit()
+        ]
+
+        avg_reaction = ""
+        if reaction_values:
+            avg_reaction = f" | Avg Reaction: {sum(reaction_values) / len(reaction_values):.1f} ms"
+
+        self.records_summary_label.config(
+            text=(
+                f"{player}: Round Wins={wins}, Round Losses={losses}, "
+                f"Game Wins={game_wins}, Game Losses={game_losses}"
+                f"{avg_reaction}"
+            )
+        )
+
+    # ==========================
+    # Visualization
+    # ==========================
+
+    def fill_visualization_names(self):
+        p1 = self.player1_name.get().strip()
+        p2 = self.player2_name.get().strip()
+
+        self.plot_player_name.set(p1)
+        self.head_to_head_player.set(p1)
+        self.head_to_head_opponent.set(p2)
+
+    def plot_reaction_times(self):
+        player = self.plot_player_name.get().strip()
+
+        if not player:
+            messagebox.showerror("Error", "Enter a player name for reaction-time plot.")
+            return
+
+        rows = self.read_player_reactions(player)
+
+        reaction_times = []
+        labels = []
+
+        for i, row in enumerate(rows, start=1):
+            value = row.get("player_reaction_ms", "")
+
+            if value:
+                reaction_times.append(int(value))
+                labels.append(i)
+
+        if not reaction_times:
+            messagebox.showinfo("No Data", f"No reaction-time data found for {player}.")
+            return
+
+        plt.figure()
+        plt.plot(labels, reaction_times, marker="o")
+        plt.title(f"{player} Reaction Times Over Sessions")
+        plt.xlabel("Round Record Number")
+        plt.ylabel("Reaction Time (ms)")
+        plt.grid(True)
+        plt.show()
+
+    def plot_head_to_head(self):
+        player = self.head_to_head_player.get().strip()
+        opponent = self.head_to_head_opponent.get().strip()
+
+        if not player or not opponent:
+            messagebox.showerror("Error", "Enter both player and opponent names.")
+            return
+
+        reaction_rows = self.read_player_reactions(player)
+        victory_rows = self.read_player_victories(player)
+
+        reaction_rows = [
+            row for row in reaction_rows
+            if row.get("opponent", "") == opponent
+        ]
+
+        victory_rows = [
+            row for row in victory_rows
+            if row.get("opponent", "") == opponent
+        ]
+
+        if not reaction_rows and not victory_rows:
+            messagebox.showinfo(
+                "No Data",
+                f"No head-to-head data found for {player} against {opponent}."
+            )
+            return
+
+        round_wins = 0
+        round_losses = 0
+        round_ties = 0
+        player_reactions = []
+
+        for row in reaction_rows:
+            result = row.get("round_result", "")
+
+            if result == "WIN":
+                round_wins += 1
+            elif result == "LOSS":
+                round_losses += 1
+            elif result == "TIE":
+                round_ties += 1
+
+            reaction = row.get("player_reaction_ms", "")
+            if reaction:
+                player_reactions.append(int(reaction))
+
+        game_wins = 0
+        game_losses = 0
+
+        for row in victory_rows:
+            result = row.get("game_result", "")
+
+            if result == "WIN":
+                game_wins += 1
+            elif result == "LOSS":
+                game_losses += 1
+
+        plt.figure()
+        plt.bar(["Round Wins", "Round Losses", "Round Ties"], [round_wins, round_losses, round_ties])
+        plt.title(f"Round Results: {player} vs {opponent}")
+        plt.ylabel("Number of Rounds")
+        plt.show()
+
+        total_games = game_wins + game_losses
+
+        if total_games > 0:
+            win_rate = (game_wins / total_games) * 100
+            loss_rate = (game_losses / total_games) * 100
+
+            plt.figure()
+            plt.bar(["Game Win Rate", "Game Loss Rate"], [win_rate, loss_rate])
+            plt.title(f"Game Win Rate: {player} vs {opponent}")
+            plt.ylabel("Percentage (%)")
+            plt.ylim(0, 100)
+            plt.show()
+
+        if player_reactions:
+            plt.figure()
+            plt.plot(range(1, len(player_reactions) + 1), player_reactions, marker="o")
+            plt.title(f"{player} Reaction Times Against {opponent}")
+            plt.xlabel("Round Number Against This Opponent")
+            plt.ylabel("Reaction Time (ms)")
+            plt.grid(True)
+            plt.show()
+
+    # ==========================
+    # Utility
+    # ==========================
+
+    def log(self, message):
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+
+    def on_close(self):
+        self.running = False
+
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ReactionGameGUI(root)
+    root.mainloop()
